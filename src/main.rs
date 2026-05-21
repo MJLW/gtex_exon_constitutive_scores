@@ -267,6 +267,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .delimiter(b'\t')
         .from_path(args.output)?;
 
+    writer.write_record(&[
+        "EXON_ID",
+        "CHROM",
+        "START",
+        "END",
+        "STRAND",
+        "CONSTITUTIVE_SCORE",
+        "VARIANCE",
+    ])?;
+
     for score in scores {
         if let Some(region) = metadata.get_exon(&score.key) {
             writer.write_record(&[
