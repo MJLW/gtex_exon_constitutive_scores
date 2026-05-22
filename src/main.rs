@@ -8,7 +8,7 @@ use csv::WriterBuilder;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 
 mod metadata;
-use crate::metadata::{MetadataTable, read_metadata_tsv};
+use crate::metadata::{DonorMetadataTable, ExonMetadataTable};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -20,13 +20,18 @@ struct Args {
     exon_metadata: PathBuf,
 
     #[arg(long)]
+    donor_metadata: PathBuf,
+
+    #[arg(long)]
     output: PathBuf,
 }
 
 struct Score {
     key: String,
-    constitutive_score: f64,
-    variance: f64,
+    constitutive_score: f32,
+    total_variance: f32,
+    tissue_variance: f32,
+    donor_variance: f32,
 }
 
 fn find_gene_boundaries(arr: &StringArray) -> Vec<usize> {
@@ -112,28 +117,113 @@ fn calculate_constitutive_scores(
         .collect()
 }
 
-fn prep_for_statrs(flat_data: Vec<f32>, n_rows: usize, n_cols: usize) -> Vec<Vec<f64>> {
+fn as_row_major_matrix(flat_data: Vec<f32>, n_rows: usize, n_cols: usize) -> Vec<Vec<f32>> {
     (0..n_rows)
         .into_iter()
         .map(|i| {
             (0..n_cols)
                 .into_iter()
-                .map(|j| flat_data[i + n_rows * j] as f64)
+                .map(|j| flat_data[i + n_rows * j])
                 .collect()
         })
         .collect()
 }
 
-// fn calculate_variance(data: &Vec<f64>) -> f64
+fn calculate_median(mut data: Vec<f32>) -> f32 {
+    data.sort_unstable_by(|a, b| a.total_cmp(b));
+    let len = data.len();
+
+    data[len / 2]
+}
+
+fn calculate_variance(data: &Vec<f32>) -> f32 {
+    let len = data.len();
+    let mean: f32 = data.iter().sum::<f32>() / (len as f32);
+
+    data.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (len as f32)
+}
+
+fn get_sample_indices_for_tissues<'a>(
+    sample_ids: &Vec<String>,
+    donor_metadata: &'a DonorMetadataTable,
+) -> Vec<(&'a str, Vec<usize>)> {
+    donor_metadata
+        .get_tissues()
+        .iter()
+        .map(|&t| {
+            (
+                t,
+                donor_metadata
+                    .get_tissue_samples(t)
+                    .unwrap()
+                    .iter()
+                    .map(|ts| sample_ids.iter().position(|s| ts == s).unwrap())
+                    .collect::<Vec<usize>>(),
+            )
+        })
+        .collect()
+}
+
+fn get_sample_indices_for_donors<'a>(
+    sample_ids: &Vec<String>,
+    donor_metadata: &'a DonorMetadataTable,
+) -> Vec<(&'a str, Vec<usize>)> {
+    donor_metadata
+        .get_donors()
+        .iter()
+        .map(|&t| {
+            (
+                t,
+                donor_metadata
+                    .get_donor_samples(t)
+                    .unwrap()
+                    .iter()
+                    .map(|ts| sample_ids.iter().position(|s| ts == s).unwrap())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn calculate_variance_over_group_medians(
+    scores_row: &Vec<f32>,
+    column_indices_per_group: &Vec<(&str, Vec<usize>)>,
+) -> f32 {
+    let medians: Vec<f32> = column_indices_per_group
+        .iter()
+        .map(|(_, indices)| indices.iter().map(|&i| scores_row[i]).collect())
+        .map(|scores| calculate_median(scores))
+        .collect();
+
+    calculate_variance(&medians)
+}
 
 // WARN: Made to work with GTEx v7, very particular to the column order and data types.
 fn read_exon_parquet(
     path: PathBuf,
-    metadata_table: &MetadataTable,
+    exon_metadata: &ExonMetadataTable,
+    donor_metadata: &DonorMetadataTable,
 ) -> Result<Vec<Score>, Box<dyn std::error::Error>> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+    const CHUNK_SIZE: usize = 2048;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.with_batch_size(CHUNK_SIZE);
+
+    // Parse column information from metadata
     let metadata = builder.metadata().file_metadata();
     let n_columns = metadata.schema_descr().num_columns() as usize;
+
+    // Grab data columns, skip Description and Name columns
+    let sample_ids: Vec<String> = metadata
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect::<Vec<_>>()[1..n_columns - 1]
+        .to_vec();
+
+    let column_indices_per_tissue = get_sample_indices_for_tissues(&sample_ids, donor_metadata);
+    let column_indices_per_donor = get_sample_indices_for_donors(&sample_ids, donor_metadata);
+
     let mut scores: Vec<Score> = Vec::with_capacity(metadata.num_rows() as usize);
 
     let mut reader: ParquetRecordBatchReader = builder.build()?;
@@ -160,7 +250,7 @@ fn read_exon_parquet(
         // Get exon sizes from metadata table
         let exon_sizes: Vec<usize> = name_array
             .iter()
-            .map(|n| metadata_table.get_exon(n.unwrap()).unwrap().size)
+            .map(|n| exon_metadata.get_exon(n.unwrap()).unwrap().size)
             .collect();
 
         // Process read counts
@@ -175,26 +265,24 @@ fn read_exon_parquet(
             .collect();
 
         // Reorder scores such that samples are stored contiguously
-        let reordered_scores: Vec<Vec<f64>> = prep_for_statrs(constitutive_scores, n_rows, n_cols);
+        let reordered_scores: Vec<Vec<f32>> =
+            as_row_major_matrix(constitutive_scores, n_rows, n_cols);
 
         let batch_scores: Vec<Score> = reordered_scores
             .iter()
             .zip(name_array)
-            .map(|(row, name)| {
-                let mut sorted_row = row.clone();
-                sorted_row.sort_unstable_by(|a, b| a.total_cmp(b));
-                let len = sorted_row.len();
-                let median = sorted_row[len / 2];
-
-                let mean: f64 = row.iter().sum::<f64>() / (len as f64);
-                let variance =
-                    row.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (len as f64);
-
-                Score {
-                    key: name.unwrap().to_string(),
-                    constitutive_score: median,
-                    variance: variance,
-                }
+            .map(|(row, name)| Score {
+                key: name.unwrap().to_string(),
+                constitutive_score: calculate_median(row.clone()),
+                total_variance: calculate_variance(&row),
+                tissue_variance: calculate_variance_over_group_medians(
+                    &row,
+                    &column_indices_per_tissue,
+                ),
+                donor_variance: calculate_variance_over_group_medians(
+                    &row,
+                    &column_indices_per_donor,
+                ),
             })
             .collect();
 
@@ -209,7 +297,7 @@ fn read_exon_parquet(
         let name_array = get_batch_column_as_array::<StringArray>(&batch, n_columns - 1);
         let exon_sizes: Vec<usize> = name_array
             .iter()
-            .map(|n| metadata_table.get_exon(n.unwrap()).unwrap().size)
+            .map(|n| exon_metadata.get_exon(n.unwrap()).unwrap().size)
             .collect();
 
         let n_rows = batch.num_rows();
@@ -227,26 +315,24 @@ fn read_exon_parquet(
             .flatten()
             .collect();
 
-        let reordered_scores: Vec<Vec<f64>> = prep_for_statrs(constitutive_scores, n_rows, n_cols);
+        let reordered_scores: Vec<Vec<f32>> =
+            as_row_major_matrix(constitutive_scores, n_rows, n_cols);
 
         let batch_scores: Vec<Score> = reordered_scores
             .iter()
             .zip(name_array)
-            .map(|(row, name)| {
-                let mut sorted_row = row.clone();
-                sorted_row.sort_unstable_by(|a, b| a.total_cmp(b));
-                let len = sorted_row.len();
-                let median = sorted_row[len / 2];
-
-                let mean: f64 = row.iter().sum::<f64>() / (len as f64);
-                let variance =
-                    row.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (len as f64);
-
-                Score {
-                    key: name.unwrap().to_string(),
-                    constitutive_score: median,
-                    variance: variance,
-                }
+            .map(|(row, name)| Score {
+                key: name.unwrap().to_string(),
+                constitutive_score: calculate_median(row.clone()),
+                total_variance: calculate_variance(&row),
+                tissue_variance: calculate_variance_over_group_medians(
+                    &row,
+                    &column_indices_per_tissue,
+                ),
+                donor_variance: calculate_variance_over_group_medians(
+                    &row,
+                    &column_indices_per_donor,
+                ),
             })
             .collect();
 
@@ -259,9 +345,10 @@ fn read_exon_parquet(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let metadata: MetadataTable = read_metadata_tsv(args.exon_metadata)?;
+    let exon_metadata = ExonMetadataTable::new(args.exon_metadata)?;
+    let donor_metadata = DonorMetadataTable::new(args.donor_metadata)?;
 
-    let scores = read_exon_parquet(args.exon_counts, &metadata)?;
+    let scores = read_exon_parquet(args.exon_counts, &exon_metadata, &donor_metadata)?;
 
     let mut writer = WriterBuilder::new()
         .delimiter(b'\t')
@@ -274,11 +361,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "END",
         "STRAND",
         "CONSTITUTIVE_SCORE",
-        "VARIANCE",
+        "TOTAL_VARIANCE",
+        "TISSUE_VARIANCE",
+        "DONOR_VARIANCE",
     ])?;
 
     for score in scores {
-        if let Some(region) = metadata.get_exon(&score.key) {
+        if let Some(region) = exon_metadata.get_exon(&score.key) {
             writer.write_record(&[
                 score.key,
                 region.chr.clone(),
@@ -286,7 +375,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 region.end.to_string(),
                 region.strand.clone(),
                 score.constitutive_score.to_string(),
-                score.variance.to_string(),
+                score.total_variance.to_string(),
+                score.tissue_variance.to_string(),
+                score.donor_variance.to_string(),
             ])?;
         }
     }
