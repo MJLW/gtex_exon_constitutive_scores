@@ -2,7 +2,7 @@ use clap::Parser;
 use core::f32;
 use std::{fs::File, path::PathBuf};
 
-use arrow_array::{Array, Float32Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrowNativeTypeOp, Float32Array, RecordBatch, StringArray};
 use arrow_select::concat::concat_batches;
 use csv::WriterBuilder;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
@@ -29,6 +29,9 @@ struct Args {
 struct Score {
     key: String,
     constitutive_score: f32,
+    total_mean: f32,
+    tissue_mean: f32,
+    donor_mean: f32,
     total_variance: f32,
     tissue_variance: f32,
     donor_variance: f32,
@@ -129,6 +132,11 @@ fn as_row_major_matrix(flat_data: Vec<f32>, n_rows: usize, n_cols: usize) -> Vec
         .collect()
 }
 
+fn calculate_mean(data: &Vec<f32>) -> f32 {
+    let len = data.len();
+    data.iter().sum::<f32>() / (len as f32)
+}
+
 fn calculate_median(mut data: Vec<f32>) -> f32 {
     data.sort_unstable_by(|a, b| a.total_cmp(b));
     let len = data.len();
@@ -136,11 +144,13 @@ fn calculate_median(mut data: Vec<f32>) -> f32 {
     data[len / 2]
 }
 
-fn calculate_variance(data: &Vec<f32>) -> f32 {
+fn calculate_standardized_variance(data: &Vec<f32>) -> f32 {
     let len = data.len();
     let mean: f32 = data.iter().sum::<f32>() / (len as f32);
 
-    data.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (len as f32)
+    (data.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (len as f32))
+        .div_checked(mean)
+        .unwrap_or(0.0)
 }
 
 fn get_sample_indices_for_tissues<'a>(
@@ -195,7 +205,20 @@ fn calculate_variance_over_group_medians(
         .map(|scores| calculate_median(scores))
         .collect();
 
-    calculate_variance(&medians)
+    calculate_standardized_variance(&medians)
+}
+
+fn calculate_mean_over_group_medians(
+    scores_row: &Vec<f32>,
+    column_indices_per_group: &Vec<(&str, Vec<usize>)>,
+) -> f32 {
+    let medians: Vec<f32> = column_indices_per_group
+        .iter()
+        .map(|(_, indices)| indices.iter().map(|&i| scores_row[i]).collect())
+        .map(|scores| calculate_median(scores))
+        .collect();
+
+    calculate_mean(&medians)
 }
 
 // WARN: Made to work with GTEx v7, very particular to the column order and data types.
@@ -255,32 +278,57 @@ fn read_exon_parquet(
 
         // Process read counts
         let n_cols = n_columns - 2;
-        let constitutive_scores: Vec<_> = (1..n_cols + 1)
+        let count_arrays: Vec<_> = (1..n_cols + 1)
             .into_iter()
             .map(|i| get_batch_column_as_array::<Float32Array>(&batch, i))
-            .map(|read_counts| {
-                calculate_constitutive_scores(read_counts, &exon_sizes, &gene_boundaries)
+            .collect();
+
+        let counts: Vec<f32> = count_arrays
+            .iter()
+            .map(|col| col.iter().map(|x| x.unwrap() as f32).collect::<Vec<f32>>())
+            .flatten()
+            .collect();
+
+        // println!("{:?}", calculate_median(data)counts);
+
+        let constitutive_scores: Vec<_> = count_arrays
+            .into_iter()
+            .map(|sample_counts| {
+                calculate_constitutive_scores(sample_counts, &exon_sizes, &gene_boundaries)
             })
             .flatten()
             .collect();
 
         // Reorder scores such that samples are stored contiguously
+        let reordered_counts: Vec<Vec<f32>> = as_row_major_matrix(counts, n_rows, n_cols);
         let reordered_scores: Vec<Vec<f32>> =
             as_row_major_matrix(constitutive_scores, n_rows, n_cols);
 
+        // println!("{:?}", reordered_counts);
+
         let batch_scores: Vec<Score> = reordered_scores
             .iter()
+            .zip(reordered_counts)
             .zip(name_array)
-            .map(|(row, name)| Score {
+            .map(|((score_row, counts_row), name)| Score {
                 key: name.unwrap().to_string(),
-                constitutive_score: calculate_median(row.clone()),
-                total_variance: calculate_variance(&row),
+                constitutive_score: calculate_median(score_row.clone()),
+                total_mean: calculate_mean(&counts_row),
+                tissue_mean: calculate_mean_over_group_medians(
+                    &counts_row,
+                    &column_indices_per_tissue,
+                ),
+                donor_mean: calculate_mean_over_group_medians(
+                    &counts_row,
+                    &column_indices_per_donor,
+                ),
+                total_variance: calculate_standardized_variance(&counts_row),
                 tissue_variance: calculate_variance_over_group_medians(
-                    &row,
+                    &counts_row,
                     &column_indices_per_tissue,
                 ),
                 donor_variance: calculate_variance_over_group_medians(
-                    &row,
+                    &counts_row,
                     &column_indices_per_donor,
                 ),
             })
@@ -302,9 +350,20 @@ fn read_exon_parquet(
 
         let n_rows = batch.num_rows();
         let n_cols = n_columns - 2;
-        let constitutive_scores: Vec<_> = (1..n_cols + 1)
+
+        let count_arrays: Vec<_> = (1..n_cols + 1)
             .into_iter()
             .map(|i| get_batch_column_as_array::<Float32Array>(&batch, i))
+            .collect();
+
+        let counts: Vec<f32> = count_arrays
+            .iter()
+            .map(|col| col.iter().map(|x| x.unwrap() as f32).collect::<Vec<f32>>())
+            .flatten()
+            .collect();
+
+        let constitutive_scores: Vec<_> = count_arrays
+            .iter()
             .map(|read_counts| {
                 calculate_constitutive_scores(
                     read_counts,
@@ -315,22 +374,34 @@ fn read_exon_parquet(
             .flatten()
             .collect();
 
+        let reordered_counts: Vec<Vec<f32>> = as_row_major_matrix(counts, n_rows, n_cols);
+
         let reordered_scores: Vec<Vec<f32>> =
             as_row_major_matrix(constitutive_scores, n_rows, n_cols);
 
         let batch_scores: Vec<Score> = reordered_scores
             .iter()
+            .zip(reordered_counts)
             .zip(name_array)
-            .map(|(row, name)| Score {
+            .map(|((score_row, counts_row), name)| Score {
                 key: name.unwrap().to_string(),
-                constitutive_score: calculate_median(row.clone()),
-                total_variance: calculate_variance(&row),
+                constitutive_score: calculate_median(score_row.clone()),
+                total_mean: calculate_mean(&counts_row),
+                tissue_mean: calculate_mean_over_group_medians(
+                    &counts_row,
+                    &column_indices_per_tissue,
+                ),
+                donor_mean: calculate_mean_over_group_medians(
+                    &counts_row,
+                    &column_indices_per_donor,
+                ),
+                total_variance: calculate_standardized_variance(&score_row),
                 tissue_variance: calculate_variance_over_group_medians(
-                    &row,
+                    &score_row,
                     &column_indices_per_tissue,
                 ),
                 donor_variance: calculate_variance_over_group_medians(
-                    &row,
+                    &score_row,
                     &column_indices_per_donor,
                 ),
             })
@@ -361,6 +432,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "END",
         "STRAND",
         "CONSTITUTIVE_SCORE",
+        "TOTAL_MEAN",
+        "TISSUE_MEAN",
+        "DONOR_MEAN",
         "TOTAL_VARIANCE",
         "TISSUE_VARIANCE",
         "DONOR_VARIANCE",
@@ -375,6 +449,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 region.end.to_string(),
                 region.strand.clone(),
                 score.constitutive_score.to_string(),
+                score.total_mean.to_string(),
+                score.tissue_mean.to_string(),
+                score.donor_mean.to_string(),
                 score.total_variance.to_string(),
                 score.tissue_variance.to_string(),
                 score.donor_variance.to_string(),
