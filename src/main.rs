@@ -29,7 +29,8 @@ struct Args {
 struct Score {
     key: String,
     constitutive_score: f32,
-    constitutive_variance: f32,
+    constitutive_tissue_variance: f32,
+    constitutive_donor_variance: f32,
     n_expressed_tissues: usize,
     total_mean: f32,
     tissue_mean: f32,
@@ -140,12 +141,21 @@ fn as_row_major_matrix(flat_data: Vec<f32>, n_rows: usize, n_cols: usize) -> Vec
 
 fn calculate_mean(data: &Vec<f32>) -> f32 {
     let finite_data: Vec<&f32> = data.iter().filter(|&v| !v.is_finite()).collect();
+
+    if finite_data.len() == 0 {
+        return f32::NAN;
+    }
+
     let len = finite_data.len();
     finite_data.into_iter().sum::<f32>() / (len as f32)
 }
 
 fn calculate_median(data: &Vec<f32>) -> f32 {
     let mut finite_data: Vec<&f32> = data.iter().filter(|&v| v.is_finite()).collect();
+
+    if finite_data.len() == 0 {
+        return f32::NAN;
+    }
 
     finite_data.sort_unstable_by(|&a, &b| a.total_cmp(b));
     let len = finite_data.len();
@@ -306,6 +316,18 @@ fn read_exon_parquet(
             })
             .collect();
 
+        let sample_constitutive_scores: Vec<_> = column_counts
+            .iter()
+            .map(|counts| {
+                calculate_constitutive_scores(
+                    counts.as_slice(),
+                    exon_sizes.as_slice(),
+                    gene_boundaries.as_slice(),
+                )
+            })
+            .flatten()
+            .collect();
+
         let tissues_counts: Vec<Vec<f32>> = column_indices_per_tissue
             .iter()
             .map(|(_, indices)| {
@@ -326,7 +348,7 @@ fn read_exon_parquet(
             })
             .collect();
 
-        let constitutive_scores: Vec<_> = tissues_counts
+        let tissue_constitutive_scores: Vec<_> = tissues_counts
             .iter()
             .map(|tissue_counts| {
                 calculate_constitutive_scores(
@@ -341,17 +363,33 @@ fn read_exon_parquet(
         // Reorder scores such that samples are stored contiguously
         let counts: Vec<f32> = column_counts.into_iter().flatten().collect();
         let row_counts: Vec<Vec<f32>> = as_row_major_matrix(counts, n_rows, n_cols);
-        let row_scores: Vec<Vec<f32>> =
-            as_row_major_matrix(constitutive_scores, n_rows, tissues_counts.len());
+        let row_tissue_scores: Vec<Vec<f32>> =
+            as_row_major_matrix(tissue_constitutive_scores, n_rows, tissues_counts.len());
 
-        let batch_scores: Vec<Score> = row_scores
+        let constitutive_donor_variances: Vec<f32> =
+            as_row_major_matrix(sample_constitutive_scores, n_rows, n_cols)
+                .into_iter()
+                .map(|row| {
+                    let tissue_variances: Vec<_> = column_indices_per_tissue
+                        .iter()
+                        .map(|(_, indices)| indices.iter().map(|&i| row[i]).collect::<Vec<f32>>())
+                        .map(|donor_scores| calculate_standardized_variance(&donor_scores))
+                        .collect();
+
+                    calculate_standardized_variance(&tissue_variances)
+                })
+                .collect();
+
+        let batch_scores: Vec<Score> = row_tissue_scores
             .iter()
+            .zip(constitutive_donor_variances)
             .zip(row_counts)
             .zip(&name_array)
-            .map(|((score_row, counts_row), name)| Score {
+            .map(|(((score_row, donor_variance), counts_row), name)| Score {
                 key: name.unwrap().to_string(),
                 constitutive_score: calculate_median(&score_row),
-                constitutive_variance: calculate_standardized_variance(&score_row),
+                constitutive_tissue_variance: calculate_standardized_variance(&score_row),
+                constitutive_donor_variance: donor_variance,
                 n_expressed_tissues: score_row.iter().filter(|&&score| score > 0.0).count(),
                 total_mean: calculate_mean(&counts_row),
                 tissue_mean: calculate_mean_over_group_medians(
@@ -401,6 +439,18 @@ fn read_exon_parquet(
             .map(|col| col.iter().map(|x| x.unwrap() as f32).collect::<Vec<f32>>())
             .collect();
 
+        let sample_constitutive_scores: Vec<_> = column_counts
+            .iter()
+            .map(|counts| {
+                calculate_constitutive_scores(
+                    counts.as_slice(),
+                    exon_sizes.as_slice(),
+                    &vec![(0, batch.num_rows())],
+                )
+            })
+            .flatten()
+            .collect();
+
         let tissues_counts: Vec<Vec<f32>> = column_indices_per_tissue
             .iter()
             .map(|(_, indices)| {
@@ -438,34 +488,55 @@ fn read_exon_parquet(
         let reordered_scores: Vec<Vec<f32>> =
             as_row_major_matrix(constitutive_scores, n_rows, tissues_counts.len());
 
+        let constitutive_donor_variances: Vec<f32> =
+            as_row_major_matrix(sample_constitutive_scores, n_rows, n_cols)
+                .into_iter()
+                .map(|row| {
+                    let tissue_variances: Vec<_> = column_indices_per_tissue
+                        .iter()
+                        .map(|(_, indices)| indices.iter().map(|&i| row[i]).collect::<Vec<f32>>())
+                        .map(|donor_scores| calculate_standardized_variance(&donor_scores))
+                        .collect();
+
+                    calculate_standardized_variance(&tissue_variances)
+                })
+                .collect();
+
         let batch_scores: Vec<Score> = reordered_scores
             .iter()
+            .zip(constitutive_donor_variances)
             .zip(reordered_counts)
             .zip(name_array)
-            .map(|((score_row, counts_row), name)| Score {
-                key: name.unwrap().to_string(),
-                constitutive_score: calculate_median(&score_row),
-                constitutive_variance: calculate_standardized_variance(&score_row),
-                n_expressed_tissues: score_row.iter().filter(|&&score| score.is_finite()).count(),
-                total_mean: calculate_mean(&counts_row),
-                tissue_mean: calculate_mean_over_group_medians(
-                    &counts_row,
-                    &column_indices_per_tissue,
-                ),
-                donor_mean: calculate_mean_over_group_medians(
-                    &counts_row,
-                    &column_indices_per_donor,
-                ),
-                total_variance: calculate_standardized_variance(&counts_row),
-                tissue_variance: calculate_variance_over_group_medians(
-                    &counts_row,
-                    &column_indices_per_tissue,
-                ),
-                donor_variance: calculate_variance_over_group_medians(
-                    &counts_row,
-                    &column_indices_per_donor,
-                ),
-            })
+            .map(
+                |(((score_row, constitutive_donor_variance), counts_row), name)| Score {
+                    key: name.unwrap().to_string(),
+                    constitutive_score: calculate_median(&score_row),
+                    constitutive_tissue_variance: calculate_standardized_variance(&score_row),
+                    constitutive_donor_variance: constitutive_donor_variance,
+                    n_expressed_tissues: score_row
+                        .iter()
+                        .filter(|&&score| score.is_finite())
+                        .count(),
+                    total_mean: calculate_mean(&counts_row),
+                    tissue_mean: calculate_mean_over_group_medians(
+                        &counts_row,
+                        &column_indices_per_tissue,
+                    ),
+                    donor_mean: calculate_mean_over_group_medians(
+                        &counts_row,
+                        &column_indices_per_donor,
+                    ),
+                    total_variance: calculate_standardized_variance(&counts_row),
+                    tissue_variance: calculate_variance_over_group_medians(
+                        &counts_row,
+                        &column_indices_per_tissue,
+                    ),
+                    donor_variance: calculate_variance_over_group_medians(
+                        &counts_row,
+                        &column_indices_per_donor,
+                    ),
+                },
+            )
             .collect();
 
         scores.extend(batch_scores);
@@ -493,7 +564,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "END",
         "STRAND",
         "CONSTITUTIVE_SCORE",
-        "CONSTITUTIVE_VARIANCE",
+        "CONSTITUTIVE_TISSUE_VARIANCE",
+        "CONSTITUTIVE_DONOR_VARIANCE",
         "N_EXPRESSED_TISSUES",
         "TOTAL_MEAN",
         "TISSUE_MEAN",
@@ -512,7 +584,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 region.end.to_string(),
                 region.strand.clone(),
                 score.constitutive_score.to_string(),
-                score.constitutive_variance.to_string(),
+                score.constitutive_tissue_variance.to_string(),
+                score.constitutive_donor_variance.to_string(),
                 score.n_expressed_tissues.to_string(),
                 score.total_mean.to_string(),
                 score.tissue_mean.to_string(),
