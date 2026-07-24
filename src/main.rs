@@ -135,15 +135,18 @@ fn as_row_major_matrix(flat_data: Vec<f32>, n_rows: usize, n_cols: usize) -> Vec
 }
 
 fn calculate_mean(data: &Vec<f32>) -> f32 {
-    let len = data.len();
-    data.iter().sum::<f32>() / (len as f32)
+    let finite_data: Vec<&f32> = data.iter().filter(|&v| !v.is_finite()).collect();
+    let len = finite_data.len();
+    finite_data.into_iter().sum::<f32>() / (len as f32)
 }
 
-fn calculate_median(mut data: Vec<f32>) -> f32 {
-    data.sort_unstable_by(|a, b| a.total_cmp(b));
-    let len = data.len();
+fn calculate_median(data: &Vec<f32>) -> f32 {
+    let mut finite_data: Vec<&f32> = data.iter().filter(|&v| v.is_finite()).collect();
 
-    data[len / 2]
+    finite_data.sort_unstable_by(|&a, &b| a.total_cmp(b));
+    let len = finite_data.len();
+
+    *finite_data[len / 2]
 }
 
 fn calculate_standardized_variance(data: &Vec<f32>) -> f32 {
@@ -204,7 +207,7 @@ fn calculate_variance_over_group_medians(
     let medians: Vec<f32> = column_indices_per_group
         .iter()
         .map(|(_, indices)| indices.iter().map(|&i| scores_row[i]).collect())
-        .map(|scores| calculate_median(scores))
+        .map(|scores| calculate_median(&scores))
         .collect();
 
     calculate_standardized_variance(&medians)
@@ -217,7 +220,7 @@ fn calculate_mean_over_group_medians(
     let medians: Vec<f32> = column_indices_per_group
         .iter()
         .map(|(_, indices)| indices.iter().map(|&i| scores_row[i]).collect())
-        .map(|scores| calculate_median(scores))
+        .map(|scores| calculate_median(&scores))
         .collect();
 
     calculate_mean(&medians)
@@ -261,7 +264,7 @@ fn read_exon_parquet(
         let total_name_array = get_batch_column_as_array::<StringArray>(&batch, n_columns - 1);
         let ensgs: Vec<_> = total_name_array
             .iter()
-            .map(|name| name.unwrap().splitn(1, '.').next().unwrap())
+            .map(|name| name.unwrap().splitn(2, '.').next().unwrap())
             .collect();
 
         // It processes until the last start, because that gene will likely be incomplete
@@ -312,7 +315,7 @@ fn read_exon_parquet(
                 let row_counts = as_row_major_matrix(tissue_donor_counts, n_rows, indices.len());
                 let tissue_counts: Vec<f32> = row_counts
                     .into_iter()
-                    .map(|row| calculate_median(row))
+                    .map(|row| calculate_median(&row))
                     .collect();
 
                 tissue_counts
@@ -343,7 +346,7 @@ fn read_exon_parquet(
             .zip(&name_array)
             .map(|((score_row, counts_row), name)| Score {
                 key: name.unwrap().to_string(),
-                constitutive_score: calculate_median(score_row.clone()),
+                constitutive_score: calculate_median(&score_row),
                 constitutive_variance: calculate_standardized_variance(&score_row),
                 n_expressed_tissues: score_row.iter().filter(|&&score| score > 0.0).count(),
                 total_mean: calculate_mean(&counts_row),
@@ -407,7 +410,7 @@ fn read_exon_parquet(
                 let row_counts = as_row_major_matrix(tissue_donor_counts, n_rows, indices.len());
                 let tissue_counts: Vec<f32> = row_counts
                     .into_iter()
-                    .map(|row| calculate_median(row))
+                    .map(|row| calculate_median(&row))
                     .collect();
 
                 tissue_counts
@@ -437,9 +440,9 @@ fn read_exon_parquet(
             .zip(name_array)
             .map(|((score_row, counts_row), name)| Score {
                 key: name.unwrap().to_string(),
-                constitutive_score: calculate_median(score_row.clone()),
+                constitutive_score: calculate_median(&score_row),
                 constitutive_variance: calculate_standardized_variance(&score_row),
-                n_expressed_tissues: score_row.iter().filter(|&&score| score > 0.0).count(),
+                n_expressed_tissues: score_row.iter().filter(|&&score| score.is_finite()).count(),
                 total_mean: calculate_mean(&counts_row),
                 tissue_mean: calculate_mean_over_group_medians(
                     &counts_row,
