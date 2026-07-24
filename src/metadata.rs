@@ -35,8 +35,8 @@ impl From<ExonMetadataRaw> for ExonMetadata {
             exon_id: raw.exon_id,
             chr: raw.chr,
             start: raw.start,
-            end: raw.end,
-            size: raw.end - raw.start,
+            end: raw.end + 1,
+            size: raw.end - raw.start + 1,
             strand: raw.strand,
         }
     }

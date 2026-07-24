@@ -105,7 +105,7 @@ fn calculate_constitutive_scores(
                 .map(|(x, &l)| (x, l))
                 .map(|(x, l)| match l > 0 {
                     true => x / l as f32,
-                    false => 0.0,
+                    false => f32::NAN,
                 })
                 .collect();
 
@@ -140,7 +140,7 @@ fn as_row_major_matrix(flat_data: Vec<f32>, n_rows: usize, n_cols: usize) -> Vec
 }
 
 fn calculate_mean(data: &Vec<f32>) -> f32 {
-    let finite_data: Vec<&f32> = data.iter().filter(|&v| !v.is_finite()).collect();
+    let finite_data: Vec<&f32> = data.iter().filter(|&v| v.is_finite()).collect();
 
     if finite_data.len() == 0 {
         return f32::NAN;
@@ -163,11 +163,21 @@ fn calculate_median(data: &Vec<f32>) -> f32 {
     *finite_data[len / 2]
 }
 
-fn calculate_standardized_variance(data: &Vec<f32>) -> f32 {
-    let len = data.len();
-    let mean: f32 = data.iter().sum::<f32>() / (len as f32);
+fn calculate_standardized_variance(data: &[f32]) -> f32 {
+    let finite_data: Vec<&f32> = data.iter().filter(|v| v.is_finite()).collect();
 
-    (data.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (len as f32))
+    if finite_data.len() == 0 {
+        return f32::NAN;
+    }
+
+    let len = finite_data.len();
+    let mean: f32 = finite_data.iter().map(|&v| v).sum::<f32>() / (len as f32);
+
+    (finite_data
+        .into_iter()
+        .map(|&x| (x - mean) * (x - mean))
+        .sum::<f32>()
+        / (len as f32))
         .div_checked(mean)
         .unwrap_or(f32::NAN)
 }
@@ -376,7 +386,7 @@ fn read_exon_parquet(
                         .map(|donor_scores| calculate_standardized_variance(&donor_scores))
                         .collect();
 
-                    calculate_standardized_variance(&tissue_variances)
+                    calculate_mean(&tissue_variances)
                 })
                 .collect();
 
@@ -390,7 +400,7 @@ fn read_exon_parquet(
                 constitutive_score: calculate_median(&score_row),
                 constitutive_tissue_variance: calculate_standardized_variance(&score_row),
                 constitutive_donor_variance: donor_variance,
-                n_expressed_tissues: score_row.iter().filter(|&&score| score > 0.0).count(),
+                n_expressed_tissues: score_row.iter().filter(|&&score| score.is_finite()).count(),
                 total_mean: calculate_mean(&counts_row),
                 tissue_mean: calculate_mean_over_group_medians(
                     &counts_row,
@@ -498,7 +508,7 @@ fn read_exon_parquet(
                         .map(|donor_scores| calculate_standardized_variance(&donor_scores))
                         .collect();
 
-                    calculate_standardized_variance(&tissue_variances)
+                    calculate_mean(&tissue_variances)
                 })
                 .collect();
 
