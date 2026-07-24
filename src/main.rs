@@ -397,7 +397,7 @@ fn read_exon_parquet(
             .zip(&name_array)
             .map(|(((score_row, donor_variance), counts_row), name)| Score {
                 key: name.unwrap().to_string(),
-                constitutive_score: calculate_median(&score_row),
+                constitutive_score: calculate_mean(&score_row),
                 constitutive_tissue_variance: calculate_standardized_variance(&score_row),
                 constitutive_donor_variance: donor_variance,
                 n_expressed_tissues: score_row.iter().filter(|&&score| score.is_finite()).count(),
@@ -520,7 +520,7 @@ fn read_exon_parquet(
             .map(
                 |(((score_row, constitutive_donor_variance), counts_row), name)| Score {
                     key: name.unwrap().to_string(),
-                    constitutive_score: calculate_median(&score_row),
+                    constitutive_score: calculate_mean(&score_row),
                     constitutive_tissue_variance: calculate_standardized_variance(&score_row),
                     constitutive_donor_variance: constitutive_donor_variance,
                     n_expressed_tissues: score_row
