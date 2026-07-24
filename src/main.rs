@@ -101,7 +101,11 @@ fn calculate_constitutive_scores(
             let coverages: Vec<f32> = gene_reads
                 .iter()
                 .zip(lengths)
-                .map(|(x, l)| x / (*l as f32))
+                .map(|(x, &l)| (x, l))
+                .map(|(x, l)| match l > 0 {
+                    true => x / l as f32,
+                    false => 0.0,
+                })
                 .collect();
 
             // Divide scores by max coverage to get a ratio of how often it is expressed
